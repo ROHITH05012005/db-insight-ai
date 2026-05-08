@@ -54,7 +54,7 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 let currentDbConfig = null; // { type: 'sqlite', path: '...' } OR { type: 'postgres', url: '...' }
 
 // --- Universal Query Runner ---
-const runQuery = async (config, sql) => {
+const runQuery = async (config, sql, params = []) => {
     if (config.type === 'sqlite') {
         const rows = await runSqlJs(config.path, sql, params);
         const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
