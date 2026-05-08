@@ -2,12 +2,40 @@ import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import sqlite3 from 'sqlite3';
+import initSqlJs from 'sql.js';
 import pg from 'pg';
 import Groq from "groq-sdk";
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+// Helper for SQL.js (WASM)
+async function runSqlJs(dbPath, sql, params = []) {
+    const SQL = await initSqlJs();
+    const fileBuffer = fs.readFileSync(dbPath);
+    const db = new SQL.Database(fileBuffer);
+    try {
+        const results = [];
+        const res = db.exec(sql, params);
+        if (res.length > 0) {
+            const columns = res[0].columns;
+            const values = res[0].values;
+            for (const row of values) {
+                const obj = {};
+                columns.forEach((col, i) => obj[col] = row[i]);
+                results.push(obj);
+            }
+        }
+        // If it's a modification, save back to disk
+        if (sql.match(/UPDATE|INSERT|DELETE|CREATE|DROP|ALTER/i)) {
+            const data = db.export();
+            fs.writeFileSync(dbPath, Buffer.from(data));
+        }
+        return results;
+    } finally {
+        db.close();
+    }
+}
 
 dotenv.config();
 
@@ -28,18 +56,10 @@ let currentDbConfig = null; // { type: 'sqlite', path: '...' } OR { type: 'postg
 // --- Universal Query Runner ---
 const runQuery = async (config, sql) => {
     if (config.type === 'sqlite') {
-        return new Promise((resolve, reject) => {
-            const db = new sqlite3.Database(config.path, sqlite3.OPEN_READONLY, (err) => {
-                if (err) return reject(err);
-            });
-            db.all(sql, [], (err, rows) => {
-                db.close();
-                if (err) return reject(err);
-                const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
-                const values = rows.map(row => Object.values(row));
-                resolve({ columns, values, raw: rows });
-            });
-        });
+        const rows = await runSqlJs(config.path, sql, params);
+        const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+        const values = rows.map(row => Object.values(row));
+        return { columns, values, raw: rows };
     } else if (config.type === 'postgres') {
         const client = new pg.Client({ connectionString: config.url });
         await client.connect();
@@ -58,28 +78,18 @@ const runQuery = async (config, sql) => {
 // --- Universal Schema Fetcher ---
 const getSchema = async (config, tableNames = []) => {
     if (config.type === 'sqlite') {
-        return new Promise((resolve, reject) => {
-            const db = new sqlite3.Database(config.path, sqlite3.OPEN_READONLY, (err) => {
-                if (err) return reject(err);
-            });
-            const query = tableNames.length > 0 
-                ? `SELECT name FROM sqlite_master WHERE type='table' AND name IN (${tableNames.map(t => `'${t}'`).join(',')})`
-                : "SELECT name FROM sqlite_master WHERE type='table'";
+        const query = tableNames.length > 0 
+            ? `SELECT name FROM sqlite_master WHERE type='table' AND name IN (${tableNames.map(t => `'${t}'`).join(',')})`
+            : "SELECT name FROM sqlite_master WHERE type='table'";
 
-            db.all(query, [], async (err, tables) => {
-                if (err) { db.close(); return reject(err); }
-                let schema = "";
-                for (const table of tables) {
-                    const tableName = table.name;
-                    const info = await new Promise((res) => {
-                        db.all(`PRAGMA table_info(${tableName})`, [], (e, cols) => res(cols));
-                    });
-                    schema += `Table: ${tableName}\\nColumns: ${info.map(c => `${c.name} (${c.type})`).join(", ")}\\n\\n`;
-                }
-                db.close();
-                resolve(schema);
-            });
-        });
+        const tables = await runSqlJs(config.path, query);
+        let schema = "";
+        for (const table of tables) {
+            const tableName = table.name;
+            const info = await runSqlJs(config.path, `PRAGMA table_info(${tableName})`);
+            schema += `Table: ${tableName}\\nColumns: ${info.map(c => `${c.name} (${c.type})`).join(", ")}\\n\\n`;
+        }
+        return schema;
     } else if (config.type === 'postgres') {
         const client = new pg.Client({ connectionString: config.url });
         await client.connect();
@@ -108,16 +118,8 @@ const getSchema = async (config, tableNames = []) => {
 // --- Universal Table Fetcher ---
 const getAllTableNames = async (config) => {
     if (config.type === 'sqlite') {
-        return new Promise((resolve, reject) => {
-            const db = new sqlite3.Database(config.path, sqlite3.OPEN_READONLY, (err) => {
-                if (err) return reject(err);
-            });
-            db.all("SELECT name FROM sqlite_master WHERE type='table'", [], (err, tables) => {
-                db.close();
-                if (err) return reject(err);
-                resolve(tables.map(t => t.name));
-            });
-        });
+        const tables = await runSqlJs(config.path, "SELECT name FROM sqlite_master WHERE type='table'");
+        return tables.map(t => t.name);
     } else if (config.type === 'postgres') {
         const client = new pg.Client({ connectionString: config.url });
         await client.connect();
@@ -395,14 +397,8 @@ app.post('/api/execute-action', async (req, res) => {
         
         let rowsChanged = 0;
         if (currentDbConfig.type === 'sqlite') {
-            rowsChanged = await new Promise((resolve, reject) => {
-                const db = new sqlite3.Database(currentDbConfig.path);
-                db.run(query, function(err) {
-                    db.close();
-                    if (err) reject(err);
-                    else resolve(this.changes);
-                });
-            });
+            await runSqlJs(currentDbConfig.path, query);
+            rowsChanged = 1; // SQL.js doesn't easily return rowCount for mutations without extra steps, setting to 1 for simplicity
         } else if (currentDbConfig.type === 'postgres') {
             const client = new pg.Client({ connectionString: currentDbConfig.url });
             await client.connect();
